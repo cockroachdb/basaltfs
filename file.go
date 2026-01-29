@@ -1,114 +1,361 @@
 // File handle implementation for BasaltFS.
-//
-// Implementation reference: See ../basalt-old/pkg/basalt for the prototype
-// basaltFile implementation.
 package basaltfs
 
-import "io"
+import (
+	"io"
+	"path/filepath"
+	"sync"
 
-// File represents an open file in BasaltFS.
-// It implements the pebble/vfs.File interface.
-type File interface {
-	io.Reader
-	io.ReaderAt
-	io.Writer
-	io.Closer
+	"github.com/cockroachdb/basaltclient"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/vfs"
+)
 
-	// Sync ensures all written data is durably persisted.
-	Sync() error
+// file represents an open file in basaltfs. It implements the vfs.File interface
+// and can be configured for read-only, write-only, or read-write access.
+type file struct {
+	fs        *FS
+	name      string
+	objectID  basaltclient.ObjectID
+	replicas  []string // data addresses of replicas
+	readable  bool
+	writable  bool
+	walWriter *basaltclient.QuorumWriter // non-nil for WAL files
 
-	// Stat returns file information.
-	Stat() (FileInfo, error)
+	mu struct {
+		sync.Mutex
+		size         int64
+		offset       int64 // current read/write offset for sequential operations
+		closed       bool
+		syncedOffset int64
+		buf          []byte // write buffer for non-WAL files
+	}
 }
 
-// FileInfo provides information about a file.
-type FileInfo interface {
-	// Size returns the file size in bytes.
-	Size() int64
+var _ vfs.File = (*file)(nil)
+
+// Read reads up to len(p) bytes from the file.
+// Implements io.Reader.
+func (f *file) Read(p []byte) (n int, err error) {
+	if !f.readable {
+		return 0, errors.New("file not opened for reading")
+	}
+
+	f.mu.Lock()
+	if f.mu.closed {
+		f.mu.Unlock()
+		return 0, errors.New("file is closed")
+	}
+	offset := f.mu.offset
+	size := f.mu.size
+	f.mu.Unlock()
+
+	if offset >= size {
+		return 0, io.EOF
+	}
+
+	// Limit read to remaining bytes.
+	remaining := size - offset
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
+	}
+
+	n, err = f.ReadAt(p, offset)
+
+	f.mu.Lock()
+	f.mu.offset += int64(n)
+	f.mu.Unlock()
+
+	return n, err
 }
 
-// writableFile is a file handle for writing.
-type writableFile struct {
-	fs   *FS
-	name string
-	// TODO: Add fields:
-	// - Object ID
-	// - Replica addresses
-	// - Current offset
-	// - Blob clients
+// ReadAt reads len(p) bytes from the file at the given offset.
+// Implements io.ReaderAt.
+func (f *file) ReadAt(p []byte, off int64) (n int, err error) {
+	if !f.readable {
+		return 0, errors.New("file not opened for reading")
+	}
+
+	f.mu.Lock()
+	if f.mu.closed {
+		f.mu.Unlock()
+		return 0, errors.New("file is closed")
+	}
+	size := f.mu.size
+	f.mu.Unlock()
+
+	if off >= size {
+		return 0, io.EOF
+	}
+
+	// Select a replica for reading, preferring local AZ.
+	replica := f.fs.selectReadReplica(f.replicas)
+	if replica == "" {
+		return 0, errors.New("no replicas available")
+	}
+
+	// Acquire a data client from the pool.
+	client := f.fs.dataPool.Acquire(replica)
+	if client == nil {
+		return 0, errors.Newf("failed to acquire data client for %s", replica)
+	}
+
+	// Read from the replica.
+	n, err = client.Read(f.objectID, uint64(off), p)
+	if err != nil {
+		f.fs.dataPool.ReleaseWithError(client)
+		return n, err
+	}
+
+	f.fs.dataPool.Release(client)
+
+	// Check if we hit EOF.
+	if off+int64(n) >= size {
+		return n, io.EOF
+	}
+
+	return n, nil
 }
 
-func (f *writableFile) Write(p []byte) (n int, err error) {
-	// TODO: Implement - see basalt-old/pkg/basalt prototype:
-	// 1. Append to all replicas in parallel
-	// 2. Wait for all to succeed
-	// 3. Update offset
-	return 0, nil
+// Write writes len(p) bytes to the file.
+// Implements io.Writer.
+func (f *file) Write(p []byte) (n int, err error) {
+	if !f.writable {
+		return 0, errors.New("file not opened for writing")
+	}
+
+	f.mu.Lock()
+	if f.mu.closed {
+		f.mu.Unlock()
+		return 0, errors.New("file is closed")
+	}
+	offset := f.mu.offset
+	f.mu.Unlock()
+
+	n, err = f.writeAtLocked(p, offset)
+
+	f.mu.Lock()
+	f.mu.offset += int64(n)
+	if f.mu.offset > f.mu.size {
+		f.mu.size = f.mu.offset
+	}
+	f.mu.Unlock()
+
+	return n, err
 }
 
-func (f *writableFile) Sync() error {
-	// TODO: Implement - see basalt-old/pkg/basalt prototype:
-	// 1. Sync on all replicas in parallel
-	// 2. Wait for all to succeed
+// WriteAt writes len(p) bytes to the file at the given offset.
+// Implements io.WriterAt.
+func (f *file) WriteAt(p []byte, off int64) (n int, err error) {
+	if !f.writable {
+		return 0, errors.New("file not opened for writing")
+	}
+
+	f.mu.Lock()
+	if f.mu.closed {
+		f.mu.Unlock()
+		return 0, errors.New("file is closed")
+	}
+	f.mu.Unlock()
+
+	n, err = f.writeAtLocked(p, off)
+
+	f.mu.Lock()
+	endOffset := off + int64(n)
+	if endOffset > f.mu.size {
+		f.mu.size = endOffset
+	}
+	f.mu.Unlock()
+
+	return n, err
+}
+
+// writeAtLocked performs the actual write operation.
+func (f *file) writeAtLocked(p []byte, off int64) (n int, err error) {
+	if f.walWriter != nil {
+		// WAL files use the QuorumWriter which handles all writes internally.
+		// QuorumWriter only supports sequential appends at its tracked offset,
+		// so we append the data and let it manage the offset.
+		if err := f.walWriter.WriteAndSync(p); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
+
+	// Non-WAL files: append to all replicas.
+	var wg sync.WaitGroup
+	errs := make([]error, len(f.replicas))
+
+	for i, replica := range f.replicas {
+		wg.Add(1)
+		go func(idx int, addr string) {
+			defer wg.Done()
+			client := f.fs.dataPool.Acquire(addr)
+			if client == nil {
+				errs[idx] = errors.Newf("failed to acquire data client for %s", addr)
+				return
+			}
+			err := client.Append(f.objectID, uint64(off), p)
+			if err != nil {
+				f.fs.dataPool.ReleaseWithError(client)
+				errs[idx] = err
+				return
+			}
+			f.fs.dataPool.Release(client)
+		}(i, replica)
+	}
+
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	return len(p), nil
+}
+
+// Sync syncs the file to stable storage.
+// Implements vfs.File.Sync.
+func (f *file) Sync() error {
+	if !f.writable {
+		return nil
+	}
+
+	f.mu.Lock()
+	if f.mu.closed {
+		f.mu.Unlock()
+		return errors.New("file is closed")
+	}
+	f.mu.Unlock()
+
+	if f.walWriter != nil {
+		// WAL writes are already synced by WriteAndSync.
+		return nil
+	}
+
+	// Sync all replicas.
+	var wg sync.WaitGroup
+	errs := make([]error, len(f.replicas))
+
+	for i, replica := range f.replicas {
+		wg.Add(1)
+		go func(idx int, addr string) {
+			defer wg.Done()
+			client := f.fs.dataPool.Acquire(addr)
+			if client == nil {
+				errs[idx] = errors.Newf("failed to acquire data client for %s", addr)
+				return
+			}
+			err := client.Sync(f.objectID)
+			if err != nil {
+				f.fs.dataPool.ReleaseWithError(client)
+				errs[idx] = err
+				return
+			}
+			f.fs.dataPool.Release(client)
+		}(i, replica)
+	}
+
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+
+	f.mu.Lock()
+	f.mu.syncedOffset = f.mu.size
+	f.mu.Unlock()
+
+	// Update the FS metadata with current size.
+	f.fs.updateObjectSize(f.name, f.mu.size)
+
 	return nil
 }
 
-func (f *writableFile) Close() error {
-	// TODO: Implement - see basalt-old/pkg/basalt prototype:
-	// 1. Seal on all replicas
-	// 2. Update controller with final size
+// SyncData syncs data (but not necessarily metadata) to stable storage.
+// Implements vfs.File.SyncData.
+func (f *file) SyncData() error {
+	return f.Sync()
+}
+
+// SyncTo syncs a prefix of the file to stable storage.
+// Implements vfs.File.SyncTo.
+func (f *file) SyncTo(length int64) (fullSync bool, err error) {
+	// For simplicity, we just do a full sync.
+	err = f.Sync()
+	return true, err
+}
+
+// Close closes the file.
+// Implements io.Closer.
+func (f *file) Close() error {
+	f.mu.Lock()
+	if f.mu.closed {
+		f.mu.Unlock()
+		return nil
+	}
+	f.mu.closed = true
+	size := f.mu.size
+	f.mu.Unlock()
+
+	var firstErr error
+
+	// Close the WAL writer if present.
+	if f.walWriter != nil {
+		if err := f.walWriter.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// For writable files, seal the object.
+	if f.writable {
+		replicas := f.fs.replicasForDataAddrs(f.replicas)
+		_, err := f.fs.sealOnAll(f.fs.backgroundContext(), f.objectID, replicas)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+
+		// Update the final size in metadata.
+		f.fs.updateObjectSize(f.name, size)
+		f.fs.sealObject(f.name)
+	}
+
+	return firstErr
+}
+
+// Stat returns file information.
+// Implements vfs.File.Stat.
+func (f *file) Stat() (vfs.FileInfo, error) {
+	f.mu.Lock()
+	size := f.mu.size
+	f.mu.Unlock()
+
+	return &fileInfo{
+		name:  filepath.Base(f.name),
+		size:  size,
+		isDir: false,
+	}, nil
+}
+
+// Fd returns the raw file descriptor. Since basaltfs is not backed by
+// OS files, this returns InvalidFd.
+// Implements vfs.File.Fd.
+func (f *file) Fd() uintptr {
+	return vfs.InvalidFd
+}
+
+// Preallocate is a no-op for basaltfs.
+// Implements vfs.File.Preallocate.
+func (f *file) Preallocate(offset, length int64) error {
 	return nil
 }
 
-func (f *writableFile) Read(p []byte) (n int, err error) {
-	return 0, io.EOF
-}
-
-func (f *writableFile) ReadAt(p []byte, off int64) (n int, err error) {
-	return 0, io.EOF
-}
-
-func (f *writableFile) Stat() (FileInfo, error) {
-	return nil, nil
-}
-
-// readableFile is a file handle for reading.
-type readableFile struct {
-	fs     *FS
-	name   string
-	offset int64
-	// TODO: Add fields:
-	// - Object ID
-	// - Replica addresses
-	// - Object size
-	// - Preferred replica for reads
-}
-
-func (f *readableFile) Read(p []byte) (n int, err error) {
-	// TODO: Implement - see basalt-old/pkg/basalt prototype:
-	// 1. Read from preferred replica
-	// 2. Update offset
-	return 0, io.EOF
-}
-
-func (f *readableFile) ReadAt(p []byte, off int64) (n int, err error) {
-	// TODO: Implement - see basalt-old/pkg/basalt prototype:
-	// 1. Read from preferred replica at offset
-	return 0, io.EOF
-}
-
-func (f *readableFile) Write(p []byte) (n int, err error) {
-	return 0, io.ErrClosedPipe
-}
-
-func (f *readableFile) Sync() error {
+// Prefetch is a no-op for basaltfs.
+// Implements vfs.File.Prefetch.
+func (f *file) Prefetch(offset int64, length int64) error {
 	return nil
-}
-
-func (f *readableFile) Close() error {
-	return nil
-}
-
-func (f *readableFile) Stat() (FileInfo, error) {
-	return nil, nil
 }
