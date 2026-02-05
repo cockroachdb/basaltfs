@@ -3,7 +3,7 @@ module github.com/cockroachdb/basaltfs
 go 1.25.3
 
 require (
-	github.com/cockroachdb/basaltclient v0.0.0-20260205004109-bc80a95c093b
+	github.com/cockroachdb/basaltclient v0.0.0-20260205134836-6d447af8b476
 	github.com/cockroachdb/errors v1.12.0
 	github.com/cockroachdb/pebble v0.0.0-20260121183949-86f48627b1b4
 )
