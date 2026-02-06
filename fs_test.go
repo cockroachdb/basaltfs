@@ -72,7 +72,7 @@ func TestSelectReadReplica(t *testing.T) {
 		},
 	}
 
-	replicas := []*basaltpb.ReplicaInfo{
+	replicas := []basaltpb.ReplicaInfo{
 		{Addr: "data1:26259", Zone: "zone1"},
 		{Addr: "data2:26259", Zone: "zone2"},
 		{Addr: "data3:26259", Zone: "zone3"},

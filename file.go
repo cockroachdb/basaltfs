@@ -19,7 +19,7 @@ type file struct {
 	fs        *FS
 	name      string
 	objectID  basaltclient.ObjectID
-	replicas  []*basaltpb.ReplicaInfo // data addresses + zones
+	replicas  []basaltpb.ReplicaInfo // data addresses + zones
 	readable  bool
 	writable  bool
 	walWriter *basaltclient.QuorumWriter // non-nil for WAL files

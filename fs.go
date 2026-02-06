@@ -132,7 +132,7 @@ func isWALFile(name string) bool {
 }
 
 // selectReadReplica selects a replica for reading, preferring local zone.
-func (fs *FS) selectReadReplica(replicas []*basaltpb.ReplicaInfo) string {
+func (fs *FS) selectReadReplica(replicas []basaltpb.ReplicaInfo) string {
 	if len(replicas) == 0 {
 		return ""
 	}
