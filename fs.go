@@ -7,8 +7,8 @@
 // Usage:
 //
 //	fs, err := basaltfs.NewFS(basaltfs.Options{
-//	    Servers: "az1@ctrl1:26258,data1:26259;az2@ctrl2:26258,data2:26259",
-//	    LocalAZ: "az1",
+//	    Servers: "zone1@ctrl1:26258,data1:26259;zone2@ctrl2:26258,data2:26259",
+//	    LocalZone: "zone1",
 //	})
 //	pebbleOpts := &pebble.Options{FS: fs}
 package basaltfs
@@ -34,19 +34,19 @@ type Options struct {
 	// Default: 3
 	Replication int
 
-	// LocalAZ is this node's availability zone, used to prefer local replicas
+	// LocalZone is this node's zone, used to prefer local replicas
 	// for reads.
-	LocalAZ string
+	LocalZone string
 
 	// Servers specifies the blob servers to use. Format:
-	// "az@ctrlAddr,dataAddr;az@ctrlAddr,dataAddr;..."
-	// Example: "az1@localhost:26258,localhost:26259;az2@localhost:26260,localhost:26261"
+	// "zone@ctrlAddr,dataAddr;zone@ctrlAddr,dataAddr;..."
+	// Example: "zone1@localhost:26258,localhost:26259;zone2@localhost:26260,localhost:26261"
 	Servers string
 }
 
 // serverInfo holds connection information for a single blob server.
 type serverInfo struct {
-	az       string // availability zone
+	zone     string // zone
 	ctrlAddr string // gRPC control address (Create, Seal, Delete, Stat)
 	dataAddr string // TCP data address (Append, Read)
 }
@@ -107,7 +107,7 @@ func NewFS(opts Options) (*FS, error) {
 }
 
 // parseServers parses the server configuration string.
-// Format: "az@ctrlAddr,dataAddr;az@ctrlAddr,dataAddr;..."
+// Format: "zone@ctrlAddr,dataAddr;zone@ctrlAddr,dataAddr;..."
 func parseServers(s string) ([]serverInfo, error) {
 	if s == "" {
 		return nil, errors.New("no servers specified")
@@ -120,12 +120,12 @@ func parseServers(s string) ([]serverInfo, error) {
 			continue
 		}
 
-		// Parse "az@ctrlAddr,dataAddr"
+		// Parse "zone@ctrlAddr,dataAddr"
 		atIdx := strings.Index(part, "@")
 		if atIdx == -1 {
 			return nil, errors.Newf("invalid server format %q: missing '@'", part)
 		}
-		az := part[:atIdx]
+		zone := part[:atIdx]
 		addrs := part[atIdx+1:]
 
 		commaIdx := strings.Index(addrs, ",")
@@ -136,7 +136,7 @@ func parseServers(s string) ([]serverInfo, error) {
 		dataAddr := addrs[commaIdx+1:]
 
 		servers = append(servers, serverInfo{
-			az:       az,
+			zone:     zone,
 			ctrlAddr: ctrlAddr,
 			dataAddr: dataAddr,
 		})
@@ -208,26 +208,26 @@ func generateObjectID() (basaltclient.ObjectID, error) {
 	return id, nil
 }
 
-// selectReplicas selects servers for replication, preferring the local AZ.
+// selectReplicas selects servers for replication, preferring the local zone.
 func (fs *FS) selectReplicas() []serverInfo {
 	n := fs.opts.Replication
 	if n > len(fs.servers) {
 		n = len(fs.servers)
 	}
 
-	// Sort servers with local AZ first.
+	// Sort servers with local zone first.
 	sorted := make([]serverInfo, len(fs.servers))
 	copy(sorted, fs.servers)
 	sort.SliceStable(sorted, func(i, j int) bool {
-		iLocal := sorted[i].az == fs.opts.LocalAZ
-		jLocal := sorted[j].az == fs.opts.LocalAZ
+		iLocal := sorted[i].zone == fs.opts.LocalZone
+		jLocal := sorted[j].zone == fs.opts.LocalZone
 		return iLocal && !jLocal
 	})
 
 	return sorted[:n]
 }
 
-// selectReadReplica selects a replica for reading, preferring local AZ.
+// selectReadReplica selects a replica for reading, preferring local zone.
 func (fs *FS) selectReadReplica(replicas []string) string {
 	if len(replicas) == 0 {
 		return ""
@@ -236,7 +236,7 @@ func (fs *FS) selectReadReplica(replicas []string) string {
 	// Try to find a local replica.
 	for _, r := range replicas {
 		for _, s := range fs.servers {
-			if s.dataAddr == r && s.az == fs.opts.LocalAZ {
+			if s.dataAddr == r && s.zone == fs.opts.LocalZone {
 				return r
 			}
 		}

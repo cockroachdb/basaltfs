@@ -11,19 +11,19 @@ func TestParseServers(t *testing.T) {
 	}{
 		{
 			name:    "single server",
-			input:   "az1@localhost:26258,localhost:26259",
+			input:   "zone1@localhost:26258,localhost:26259",
 			wantErr: false,
 			count:   1,
 		},
 		{
 			name:    "multiple servers",
-			input:   "az1@host1:26258,host1:26259;az2@host2:26258,host2:26259;az3@host3:26258,host3:26259",
+			input:   "zone1@host1:26258,host1:26259;zone2@host2:26258,host2:26259;zone3@host3:26258,host3:26259",
 			wantErr: false,
 			count:   3,
 		},
 		{
 			name:    "with whitespace",
-			input:   " az1@host1:26258,host1:26259 ; az2@host2:26258,host2:26259 ",
+			input:   " zone1@host1:26258,host1:26259 ; zone2@host2:26258,host2:26259 ",
 			wantErr: false,
 			count:   2,
 		},
@@ -35,13 +35,13 @@ func TestParseServers(t *testing.T) {
 		},
 		{
 			name:    "missing @",
-			input:   "az1host1:26258,host1:26259",
+			input:   "zone1host1:26258,host1:26259",
 			wantErr: true,
 			count:   0,
 		},
 		{
 			name:    "missing comma",
-			input:   "az1@host1:26258host1:26259",
+			input:   "zone1@host1:26258host1:26259",
 			wantErr: true,
 			count:   0,
 		},
@@ -62,7 +62,7 @@ func TestParseServers(t *testing.T) {
 }
 
 func TestServerInfoParsing(t *testing.T) {
-	input := "az1@ctrl1:26258,data1:26259;az2@ctrl2:26258,data2:26259"
+	input := "zone1@ctrl1:26258,data1:26259;zone2@ctrl2:26258,data2:26259"
 	servers, err := parseServers(input)
 	if err != nil {
 		t.Fatalf("parseServers() error = %v", err)
@@ -73,8 +73,8 @@ func TestServerInfoParsing(t *testing.T) {
 	}
 
 	// Check first server
-	if servers[0].az != "az1" {
-		t.Errorf("server[0].az = %q, want %q", servers[0].az, "az1")
+	if servers[0].zone != "zone1" {
+		t.Errorf("server[0].zone = %q, want %q", servers[0].zone, "zone1")
 	}
 	if servers[0].ctrlAddr != "ctrl1:26258" {
 		t.Errorf("server[0].ctrlAddr = %q, want %q", servers[0].ctrlAddr, "ctrl1:26258")
@@ -84,8 +84,8 @@ func TestServerInfoParsing(t *testing.T) {
 	}
 
 	// Check second server
-	if servers[1].az != "az2" {
-		t.Errorf("server[1].az = %q, want %q", servers[1].az, "az2")
+	if servers[1].zone != "zone2" {
+		t.Errorf("server[1].zone = %q, want %q", servers[1].zone, "zone2")
 	}
 	if servers[1].ctrlAddr != "ctrl2:26258" {
 		t.Errorf("server[1].ctrlAddr = %q, want %q", servers[1].ctrlAddr, "ctrl2:26258")
@@ -156,15 +156,15 @@ func TestFileInfo(t *testing.T) {
 
 func TestSelectReplicas(t *testing.T) {
 	servers := []serverInfo{
-		{az: "az1", ctrlAddr: "ctrl1:26258", dataAddr: "data1:26259"},
-		{az: "az2", ctrlAddr: "ctrl2:26258", dataAddr: "data2:26259"},
-		{az: "az3", ctrlAddr: "ctrl3:26258", dataAddr: "data3:26259"},
+		{zone: "zone1", ctrlAddr: "ctrl1:26258", dataAddr: "data1:26259"},
+		{zone: "zone2", ctrlAddr: "ctrl2:26258", dataAddr: "data2:26259"},
+		{zone: "zone3", ctrlAddr: "ctrl3:26258", dataAddr: "data3:26259"},
 	}
 
 	fs := &FS{
 		opts: Options{
 			Replication: 2,
-			LocalAZ:     "az2",
+			LocalZone:   "zone2",
 		},
 		servers: servers,
 	}
@@ -174,22 +174,22 @@ func TestSelectReplicas(t *testing.T) {
 		t.Fatalf("expected 2 replicas, got %d", len(replicas))
 	}
 
-	// Local AZ should be first
-	if replicas[0].az != "az2" {
-		t.Errorf("first replica az = %q, want %q (local AZ should be preferred)", replicas[0].az, "az2")
+	// Local zone should be first
+	if replicas[0].zone != "zone2" {
+		t.Errorf("first replica zone = %q, want %q (local zone should be preferred)", replicas[0].zone, "zone2")
 	}
 }
 
 func TestSelectReadReplica(t *testing.T) {
 	servers := []serverInfo{
-		{az: "az1", ctrlAddr: "ctrl1:26258", dataAddr: "data1:26259"},
-		{az: "az2", ctrlAddr: "ctrl2:26258", dataAddr: "data2:26259"},
-		{az: "az3", ctrlAddr: "ctrl3:26258", dataAddr: "data3:26259"},
+		{zone: "zone1", ctrlAddr: "ctrl1:26258", dataAddr: "data1:26259"},
+		{zone: "zone2", ctrlAddr: "ctrl2:26258", dataAddr: "data2:26259"},
+		{zone: "zone3", ctrlAddr: "ctrl3:26258", dataAddr: "data3:26259"},
 	}
 
 	fs := &FS{
 		opts: Options{
-			LocalAZ: "az2",
+			LocalZone: "zone2",
 		},
 		servers: servers,
 	}
@@ -197,13 +197,13 @@ func TestSelectReadReplica(t *testing.T) {
 	replicas := []string{"data1:26259", "data2:26259", "data3:26259"}
 	selected := fs.selectReadReplica(replicas)
 
-	// Should prefer local AZ
+	// Should prefer local zone
 	if selected != "data2:26259" {
-		t.Errorf("selectReadReplica() = %q, want %q (local AZ replica)", selected, "data2:26259")
+		t.Errorf("selectReadReplica() = %q, want %q (local zone replica)", selected, "data2:26259")
 	}
 
 	// Test with no local replica
-	fs.opts.LocalAZ = "az4"
+	fs.opts.LocalZone = "zone4"
 	selected = fs.selectReadReplica(replicas)
 	if selected != "data1:26259" {
 		t.Errorf("selectReadReplica() = %q, want %q (first replica when no local)", selected, "data1:26259")
