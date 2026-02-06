@@ -1,21 +1,23 @@
 // Package basaltfs provides a Pebble VFS implementation backed by Basalt storage.
 //
 // BasaltFS implements the pebble/vfs.FS interface, storing all file data as
-// objects in Basalt blob servers. It coordinates with blob servers directly
-// for object creation, data operations, and sealing.
+// objects in Basalt blob servers. It coordinates with the Basalt controller for
+// namespace and lifecycle operations (Create, Seal, Delete, Rename, Link) and
+// talks directly to blob servers via the custom TCP data protocol for data
+// operations (Append, Read, Sync).
 //
 // Usage:
 //
 //	fs, err := basaltfs.NewFS(basaltfs.Options{
-//	    Servers: "zone1@ctrl1:26258,data1:26259;zone2@ctrl2:26258,data2:26259",
-//	    LocalZone: "zone1",
+//	    Controller:  "controller:26257",
+//	    DirectoryID: directoryUUID,
+//	    LocalZone:   "zone1",
 //	})
 //	pebbleOpts := &pebble.Options{FS: fs}
 package basaltfs
 
 import (
 	"context"
-	"crypto/rand"
 	"io"
 	"os"
 	"path/filepath"
@@ -24,335 +26,104 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/basaltclient"
+	"github.com/cockroachdb/basaltclient/basaltpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/vfs"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 // Options configures the FS behavior.
 type Options struct {
-	// Replication is the number of replicas for each object.
-	// Default: 3
-	Replication int
+	// Controller is the gRPC address of the Basalt controller.
+	Controller string
 
-	// LocalZone is this node's zone, used to prefer local replicas
-	// for reads.
+	// DirectoryID is the resolved store directory ID. The caller (e.g. CRDB)
+	// resolves the namespace hierarchy (cluster/store) to a directory ID
+	// before constructing the FS.
+	DirectoryID basaltpb.UUID
+
+	// LocalZone is this node's zone, used to prefer local replicas for reads.
 	LocalZone string
-
-	// Servers specifies the blob servers to use. Format:
-	// "zone@ctrlAddr,dataAddr;zone@ctrlAddr,dataAddr;..."
-	// Example: "zone1@localhost:26258,localhost:26259;zone2@localhost:26260,localhost:26261"
-	Servers string
-}
-
-// serverInfo holds connection information for a single blob server.
-type serverInfo struct {
-	zone     string // zone
-	ctrlAddr string // gRPC control address (Create, Seal, Delete, Stat)
-	dataAddr string // TCP data address (Append, Read)
-}
-
-// objectMeta holds metadata about a stored object.
-type objectMeta struct {
-	objectID basaltclient.ObjectID
-	replicas []string // data addresses of replicas
-	size     int64
-	sealed   bool
 }
 
 // FS implements vfs.FS backed by Basalt storage.
 type FS struct {
-	opts     Options
-	servers  []serverInfo
-	dataPool *basaltclient.BlobDataClientPool
+	opts        Options
+	ctrl        *basaltclient.ControllerClient
+	dataPool    *basaltclient.BlobDataClientPool
+	directoryID basaltpb.UUID
 
 	mu struct {
 		sync.Mutex
-		controlClients map[string]*basaltclient.BlobControlClient // keyed by ctrlAddr
-		objects        map[string]*objectMeta                     // keyed by file path
-		dirs           map[string]struct{}                        // virtual directories
+		// Cache of metadata for known files. Populated from controller
+		// Create/List/Stat responses. Keyed by relative path.
+		objects map[string]*basaltpb.ObjectMeta
 	}
 }
 
 var _ vfs.FS = (*FS)(nil)
 
-// NewFS creates a new FS using the given options.
+// NewFS creates a new FS using the given options. It connects to the controller
+// and populates the local file cache from the store directory.
 func NewFS(opts Options) (*FS, error) {
-	if opts.Replication == 0 {
-		opts.Replication = 3
+	if opts.Controller == "" {
+		return nil, errors.New("controller address is required")
+	}
+	var nilUUID basaltpb.UUID
+	if opts.DirectoryID == nilUUID {
+		return nil, errors.New("directory ID is required")
 	}
 
-	servers, err := parseServers(opts.Servers)
+	ctrl, err := basaltclient.NewControllerClient(opts.Controller)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "connecting to controller")
 	}
 
-	if len(servers) < opts.Replication {
-		return nil, errors.Newf("insufficient servers: have %d, need %d for replication",
-			len(servers), opts.Replication)
-	}
+	ctx := context.Background()
 
 	fs := &FS{
-		opts:     opts,
-		servers:  servers,
-		dataPool: basaltclient.NewBlobDataClientPool(),
+		opts:        opts,
+		ctrl:        ctrl,
+		dataPool:    basaltclient.NewBlobDataClientPool(),
+		directoryID: opts.DirectoryID,
 	}
-	fs.mu.controlClients = make(map[string]*basaltclient.BlobControlClient)
-	fs.mu.objects = make(map[string]*objectMeta)
-	fs.mu.dirs = make(map[string]struct{})
+	fs.mu.objects = make(map[string]*basaltpb.ObjectMeta)
 
-	// Create root directory.
-	fs.mu.dirs["/"] = struct{}{}
+	// Populate cache from controller.
+	entries, err := ctrl.List(ctx, fs.directoryID[:])
+	if err != nil {
+		ctrl.Close()
+		return nil, errors.Wrap(err, "listing store directory")
+	}
+
+	for _, entry := range entries {
+		if entry.Type == basaltpb.EntryType_ENTRY_TYPE_DIRECTORY {
+			continue
+		}
+		// Get full metadata including replica addresses.
+		statResp, err := ctrl.StatByID(ctx, entry.Id[:], false)
+		if err != nil {
+			ctrl.Close()
+			return nil, errors.Wrapf(err, "stat object %s (%s)", entry.Name, entry.Id)
+		}
+		fs.mu.objects[entry.Name] = statResp.Meta
+	}
 
 	return fs, nil
 }
 
-// parseServers parses the server configuration string.
-// Format: "zone@ctrlAddr,dataAddr;zone@ctrlAddr,dataAddr;..."
-func parseServers(s string) ([]serverInfo, error) {
-	if s == "" {
-		return nil, errors.New("no servers specified")
-	}
-
-	var servers []serverInfo
-	for _, part := range strings.Split(s, ";") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-
-		// Parse "zone@ctrlAddr,dataAddr"
-		atIdx := strings.Index(part, "@")
-		if atIdx == -1 {
-			return nil, errors.Newf("invalid server format %q: missing '@'", part)
-		}
-		zone := part[:atIdx]
-		addrs := part[atIdx+1:]
-
-		commaIdx := strings.Index(addrs, ",")
-		if commaIdx == -1 {
-			return nil, errors.Newf("invalid server format %q: missing ','", part)
-		}
-		ctrlAddr := addrs[:commaIdx]
-		dataAddr := addrs[commaIdx+1:]
-
-		servers = append(servers, serverInfo{
-			zone:     zone,
-			ctrlAddr: ctrlAddr,
-			dataAddr: dataAddr,
-		})
-	}
-
-	if len(servers) == 0 {
-		return nil, errors.New("no servers parsed from configuration")
-	}
-
-	return servers, nil
-}
-
 // Close releases resources associated with the filesystem.
 func (fs *FS) Close() error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
+	// TODO: Call ctrl.Unmount(mountID) once Mount/Unmount is implemented.
 	var firstErr error
-	for _, client := range fs.mu.controlClients {
-		if err := client.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+	if err := fs.ctrl.Close(); err != nil {
+		firstErr = err
 	}
-	fs.mu.controlClients = nil
-
 	if err := fs.dataPool.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-
 	return firstErr
-}
-
-// getControlClient returns a cached control client for the given address,
-// creating one if necessary.
-func (fs *FS) getControlClient(ctrlAddr string) (*basaltclient.BlobControlClient, error) {
-	fs.mu.Lock()
-	client := fs.mu.controlClients[ctrlAddr]
-	fs.mu.Unlock()
-
-	if client != nil {
-		return client, nil
-	}
-
-	// Create new client.
-	newClient, err := basaltclient.NewBlobControlClient(ctrlAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	fs.mu.Lock()
-	// Check again in case another goroutine created it.
-	if existing := fs.mu.controlClients[ctrlAddr]; existing != nil {
-		fs.mu.Unlock()
-		_ = newClient.Close()
-		return existing, nil
-	}
-	fs.mu.controlClients[ctrlAddr] = newClient
-	fs.mu.Unlock()
-
-	return newClient, nil
-}
-
-// generateObjectID generates a new random object ID.
-func generateObjectID() (basaltclient.ObjectID, error) {
-	var id basaltclient.ObjectID
-	if _, err := rand.Read(id[:]); err != nil {
-		return id, errors.Wrap(err, "generating object ID")
-	}
-	return id, nil
-}
-
-// selectReplicas selects servers for replication, preferring the local zone.
-func (fs *FS) selectReplicas() []serverInfo {
-	n := fs.opts.Replication
-	if n > len(fs.servers) {
-		n = len(fs.servers)
-	}
-
-	// Sort servers with local zone first.
-	sorted := make([]serverInfo, len(fs.servers))
-	copy(sorted, fs.servers)
-	sort.SliceStable(sorted, func(i, j int) bool {
-		iLocal := sorted[i].zone == fs.opts.LocalZone
-		jLocal := sorted[j].zone == fs.opts.LocalZone
-		return iLocal && !jLocal
-	})
-
-	return sorted[:n]
-}
-
-// selectReadReplica selects a replica for reading, preferring local zone.
-func (fs *FS) selectReadReplica(replicas []string) string {
-	if len(replicas) == 0 {
-		return ""
-	}
-
-	// Try to find a local replica.
-	for _, r := range replicas {
-		for _, s := range fs.servers {
-			if s.dataAddr == r && s.zone == fs.opts.LocalZone {
-				return r
-			}
-		}
-	}
-
-	// Fall back to first replica.
-	return replicas[0]
-}
-
-// createOnAll creates an object on all specified replicas.
-func (fs *FS) createOnAll(
-	ctx context.Context, id basaltclient.ObjectID, replicas []serverInfo,
-) error {
-	var wg sync.WaitGroup
-	errs := make([]error, len(replicas))
-
-	for i, r := range replicas {
-		wg.Add(1)
-		go func(idx int, replica serverInfo) {
-			defer wg.Done()
-			client, err := fs.getControlClient(replica.ctrlAddr)
-			if err != nil {
-				errs[idx] = err
-				return
-			}
-			errs[idx] = client.Create(ctx, id)
-		}(i, r)
-	}
-
-	wg.Wait()
-
-	for _, err := range errs {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// sealOnAll seals an object on all specified replicas.
-func (fs *FS) sealOnAll(
-	ctx context.Context, id basaltclient.ObjectID, replicas []serverInfo,
-) (int64, error) {
-	var wg sync.WaitGroup
-	sizes := make([]int64, len(replicas))
-	errs := make([]error, len(replicas))
-
-	for i, r := range replicas {
-		wg.Add(1)
-		go func(idx int, replica serverInfo) {
-			defer wg.Done()
-			client, err := fs.getControlClient(replica.ctrlAddr)
-			if err != nil {
-				errs[idx] = err
-				return
-			}
-			sizes[idx], errs[idx] = client.Seal(ctx, id)
-		}(i, r)
-	}
-
-	wg.Wait()
-
-	var maxSize int64
-	for i, err := range errs {
-		if err != nil {
-			return 0, err
-		}
-		if sizes[i] > maxSize {
-			maxSize = sizes[i]
-		}
-	}
-	return maxSize, nil
-}
-
-// deleteOnAll deletes an object from all specified replicas.
-func (fs *FS) deleteOnAll(
-	ctx context.Context, id basaltclient.ObjectID, replicas []serverInfo,
-) error {
-	var wg sync.WaitGroup
-	errs := make([]error, len(replicas))
-
-	for i, r := range replicas {
-		wg.Add(1)
-		go func(idx int, replica serverInfo) {
-			defer wg.Done()
-			client, err := fs.getControlClient(replica.ctrlAddr)
-			if err != nil {
-				errs[idx] = err
-				return
-			}
-			errs[idx] = client.Delete(ctx, id)
-		}(i, r)
-	}
-
-	wg.Wait()
-
-	for _, err := range errs {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// replicasForDataAddrs returns the serverInfo for the given data addresses.
-func (fs *FS) replicasForDataAddrs(dataAddrs []string) []serverInfo {
-	var result []serverInfo
-	for _, addr := range dataAddrs {
-		for _, s := range fs.servers {
-			if s.dataAddr == addr {
-				result = append(result, s)
-				break
-			}
-		}
-	}
-	return result
 }
 
 // isWALFile returns true if the file path indicates a WAL file.
@@ -360,56 +131,102 @@ func isWALFile(name string) bool {
 	return strings.HasSuffix(name, ".log")
 }
 
+// selectReadReplica selects a replica for reading, preferring local zone.
+func (fs *FS) selectReadReplica(replicas []*basaltpb.ReplicaInfo) string {
+	if len(replicas) == 0 {
+		return ""
+	}
+	for _, r := range replicas {
+		if r.Zone == fs.opts.LocalZone {
+			return r.Addr
+		}
+	}
+	return replicas[0].Addr
+}
+
+// splitPath splits a cleaned path into its components.
+func splitPath(path string) []string {
+	path = filepath.Clean(path)
+	if path == "." || path == "/" {
+		return nil
+	}
+	var components []string
+	for _, comp := range strings.Split(path, "/") {
+		if comp != "" {
+			components = append(components, comp)
+		}
+	}
+	return components
+}
+
+// splitDirBase splits a path into directory and base components.
+func splitDirBase(name string) (dir, base string) {
+	dir = filepath.Dir(name)
+	base = filepath.Base(name)
+	return dir, base
+}
+
+// resolveDir walks path components relative to fs.directoryID via StatByPath.
+func (fs *FS) resolveDir(ctx context.Context, dir string) (basaltpb.UUID, error) {
+	currentID := fs.directoryID
+	for _, comp := range splitPath(dir) {
+		resp, err := fs.ctrl.StatByPath(ctx, currentID[:], comp)
+		if err != nil {
+			return basaltpb.UUID{}, errors.Wrapf(err, "resolving %q", comp)
+		}
+		currentID = resp.Meta.Id
+	}
+	return currentID, nil
+}
+
+// resolveDirForPath resolves the parent directory for a given file path,
+// returning the parent directory ID and the base name.
+func (fs *FS) resolveDirForPath(ctx context.Context, name string) (basaltpb.UUID, string, error) {
+	dir, base := splitDirBase(name)
+	dirID, err := fs.resolveDir(ctx, dir)
+	if err != nil {
+		return basaltpb.UUID{}, "", err
+	}
+	return dirID, base, nil
+}
+
 // Create creates a new file for writing.
 // Implements vfs.FS.Create.
 func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
 	name = filepath.Clean(name)
-
-	// Generate object ID.
-	id, err := generateObjectID()
-	if err != nil {
-		return nil, err
-	}
-
-	// Select replicas.
-	replicas := fs.selectReplicas()
-	dataAddrs := make([]string, len(replicas))
-	for i, r := range replicas {
-		dataAddrs[i] = r.dataAddr
-	}
-
-	// Create object on all replicas.
 	ctx := context.Background()
-	if err := fs.createOnAll(ctx, id, replicas); err != nil {
+
+	// If file exists, remove it first.
+	fs.mu.Lock()
+	_, exists := fs.mu.objects[name]
+	fs.mu.Unlock()
+	if exists {
+		if err := fs.Remove(name); err != nil {
+			return nil, errors.Wrapf(err, "removing existing file %s", name)
+		}
+	}
+
+	// Resolve the parent directory.
+	dirID, base, err := fs.resolveDirForPath(ctx, name)
+	if err != nil {
+		return nil, errors.Wrapf(err, "resolving directory for %s", name)
+	}
+
+	// Create via controller.
+	meta, err := fs.ctrl.Create(ctx, dirID[:], base, nil)
+	if err != nil {
 		return nil, errors.Wrapf(err, "creating object for %s", name)
 	}
 
-	// Store metadata.
-	meta := &objectMeta{
-		objectID: id,
-		replicas: dataAddrs,
-		size:     0,
-		sealed:   false,
-	}
-
 	fs.mu.Lock()
-	// Remove any existing object with this name.
-	if old, exists := fs.mu.objects[name]; exists {
-		fs.mu.Unlock()
-		// Delete the old object.
-		oldReplicas := fs.replicasForDataAddrs(old.replicas)
-		_ = fs.deleteOnAll(ctx, old.objectID, oldReplicas)
-		fs.mu.Lock()
-	}
 	fs.mu.objects[name] = meta
 	fs.mu.Unlock()
 
-	// Create file handle.
 	f := &file{
 		fs:       fs,
 		name:     name,
-		objectID: id,
-		replicas: dataAddrs,
+		objectID: basaltclient.ObjectID(meta.Id),
+		replicas: meta.Replicas,
 		readable: false,
 		writable: true,
 	}
@@ -417,7 +234,7 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 
 	// For WAL files, use QuorumWriter for efficient quorum writes.
 	if isWALFile(name) {
-		f.walWriter = basaltclient.NewQuorumWriter(id, dataAddrs)
+		f.walWriter = basaltclient.NewQuorumWriter(basaltclient.ObjectID(meta.Id), meta.Replicas)
 	}
 
 	return f, nil
@@ -439,14 +256,13 @@ func (fs *FS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	f := &file{
 		fs:       fs,
 		name:     name,
-		objectID: meta.objectID,
-		replicas: meta.replicas,
+		objectID: basaltclient.ObjectID(meta.Id),
+		replicas: meta.Replicas,
 		readable: true,
 		writable: false,
 	}
-	f.mu.size = meta.size
+	f.mu.size = meta.Size_
 
-	// Apply open options.
 	for _, opt := range opts {
 		opt.Apply(f)
 	}
@@ -466,21 +282,19 @@ func (fs *FS) OpenReadWrite(
 	fs.mu.Unlock()
 
 	if !exists {
-		// Create a new file.
 		return fs.Create(name, category)
 	}
 
 	f := &file{
 		fs:       fs,
 		name:     name,
-		objectID: meta.objectID,
-		replicas: meta.replicas,
+		objectID: basaltclient.ObjectID(meta.Id),
+		replicas: meta.Replicas,
 		readable: true,
 		writable: true,
 	}
-	f.mu.size = meta.size
+	f.mu.size = meta.Size_
 
-	// Apply open options.
 	for _, opt := range opts {
 		opt.Apply(f)
 	}
@@ -499,9 +313,10 @@ func (fs *FS) OpenDir(name string) (vfs.File, error) {
 // Implements vfs.FS.Remove.
 func (fs *FS) Remove(name string) error {
 	name = filepath.Clean(name)
+	ctx := context.Background()
 
 	fs.mu.Lock()
-	meta, exists := fs.mu.objects[name]
+	_, exists := fs.mu.objects[name]
 	if exists {
 		delete(fs.mu.objects, name)
 	}
@@ -511,10 +326,20 @@ func (fs *FS) Remove(name string) error {
 		return nil // Removing non-existent file is a no-op.
 	}
 
-	// Delete from all replicas.
-	ctx := context.Background()
-	replicas := fs.replicasForDataAddrs(meta.replicas)
-	return fs.deleteOnAll(ctx, meta.objectID, replicas)
+	dirID, base, err := fs.resolveDirForPath(ctx, name)
+	if err != nil {
+		return errors.Wrapf(err, "resolving directory for %s", name)
+	}
+
+	_, err = fs.ctrl.Delete(ctx, dirID[:], base)
+	if err != nil {
+		// Treat NotFound as success — file may have been deleted concurrently.
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // RemoveAll removes a directory and all its contents.
@@ -524,35 +349,35 @@ func (fs *FS) RemoveAll(name string) error {
 	prefix := name + "/"
 
 	fs.mu.Lock()
-	// Collect all objects to delete.
-	var toDelete []*objectMeta
 	var names []string
-	for n, meta := range fs.mu.objects {
+	for n := range fs.mu.objects {
 		if n == name || strings.HasPrefix(n, prefix) {
-			toDelete = append(toDelete, meta)
 			names = append(names, n)
 		}
 	}
-	// Remove from map.
 	for _, n := range names {
 		delete(fs.mu.objects, n)
 	}
-	// Remove directory entries.
-	delete(fs.mu.dirs, name)
-	for dir := range fs.mu.dirs {
-		if strings.HasPrefix(dir, prefix) {
-			delete(fs.mu.dirs, dir)
-		}
-	}
 	fs.mu.Unlock()
 
-	// Delete objects from replicas.
 	ctx := context.Background()
 	var firstErr error
-	for _, meta := range toDelete {
-		replicas := fs.replicasForDataAddrs(meta.replicas)
-		if err := fs.deleteOnAll(ctx, meta.objectID, replicas); err != nil && firstErr == nil {
-			firstErr = err
+	for _, n := range names {
+		dirID, base, err := fs.resolveDirForPath(ctx, n)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = errors.Wrapf(err, "resolving directory for %s", n)
+			}
+			continue
+		}
+		_, err = fs.ctrl.Delete(ctx, dirID[:], base)
+		if err != nil {
+			if isNotFound(err) {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
@@ -564,21 +389,31 @@ func (fs *FS) RemoveAll(name string) error {
 func (fs *FS) Rename(oldname, newname string) error {
 	oldname = filepath.Clean(oldname)
 	newname = filepath.Clean(newname)
+	ctx := context.Background()
+
+	// Resolve the parent directory for the old name.
+	oldDirID, oldBase, err := fs.resolveDirForPath(ctx, oldname)
+	if err != nil {
+		return errors.Wrapf(err, "resolving directory for %s", oldname)
+	}
+
+	// The controller Rename operates within a single directory, so both
+	// old and new names must share the same parent directory.
+	_, newBase := splitDirBase(newname)
+
+	if err := fs.ctrl.Rename(ctx, oldDirID[:], oldBase, newBase); err != nil {
+		return err
+	}
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	meta, exists := fs.mu.objects[oldname]
-	if !exists {
-		return &os.PathError{Op: "rename", Path: oldname, Err: os.ErrNotExist}
-	}
-
-	// Remove any existing file at newname.
-	delete(fs.mu.objects, newname)
-
-	// Move metadata to new name.
+	meta := fs.mu.objects[oldname]
 	delete(fs.mu.objects, oldname)
-	fs.mu.objects[newname] = meta
+	delete(fs.mu.objects, newname)
+	if meta != nil {
+		fs.mu.objects[newname] = meta
+	}
 
 	return nil
 }
@@ -590,22 +425,29 @@ func (fs *FS) Link(oldname, newname string) error {
 	newname = filepath.Clean(newname)
 
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
 	meta, exists := fs.mu.objects[oldname]
+	fs.mu.Unlock()
+
 	if !exists {
 		return &os.PathError{Op: "link", Path: oldname, Err: os.ErrNotExist}
 	}
 
-	// Create a copy of the metadata pointing to the same object.
-	// Note: This doesn't implement true hard link semantics (ref counting).
-	linkMeta := &objectMeta{
-		objectID: meta.objectID,
-		replicas: meta.replicas,
-		size:     meta.size,
-		sealed:   meta.sealed,
+	ctx := context.Background()
+
+	newDirID, newBase, err := fs.resolveDirForPath(ctx, newname)
+	if err != nil {
+		return errors.Wrapf(err, "resolving directory for %s", newname)
 	}
-	fs.mu.objects[newname] = linkMeta
+
+	if err := fs.ctrl.Link(ctx, newDirID[:], newBase, meta.Id[:]); err != nil {
+		return err
+	}
+
+	// Add new cache entry pointing to same object (shallow copy).
+	linkMeta := *meta
+	fs.mu.Lock()
+	fs.mu.objects[newname] = &linkMeta
+	fs.mu.Unlock()
 
 	return nil
 }
@@ -625,21 +467,25 @@ func (fs *FS) ReuseForWrite(
 // MkdirAll creates a directory and all parent directories.
 // Implements vfs.FS.MkdirAll.
 func (fs *FS) MkdirAll(dir string, perm os.FileMode) error {
-	dir = filepath.Clean(dir)
-
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	// Add all path components as directories.
-	current := "/"
-	for _, part := range strings.Split(dir, "/") {
-		if part == "" {
+	components := splitPath(dir)
+	if len(components) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+	currentID := fs.directoryID
+	for _, comp := range components {
+		newID, err := fs.ctrl.Mkdir(ctx, currentID[:], comp)
+		if err != nil {
+			// May already exist — look it up.
+			resp, lookupErr := fs.ctrl.StatByPath(ctx, currentID[:], comp)
+			if lookupErr != nil {
+				return errors.Wrapf(err, "creating directory %q", comp)
+			}
+			currentID = resp.Meta.Id
 			continue
 		}
-		current = filepath.Join(current, part)
-		fs.mu.dirs[current] = struct{}{}
+		currentID = newID
 	}
-
 	return nil
 }
 
@@ -655,55 +501,20 @@ func (fs *FS) Lock(name string) (io.Closer, error) {
 // List returns the names of files in a directory.
 // Implements vfs.FS.List.
 func (fs *FS) List(dir string) ([]string, error) {
-	dir = filepath.Clean(dir)
-	if dir != "/" && !strings.HasSuffix(dir, "/") {
-		dir += "/"
+	ctx := context.Background()
+	dirID, err := fs.resolveDir(ctx, dir)
+	if err != nil {
+		return nil, err
 	}
-	if dir == "/" {
-		dir = ""
+	entries, err := fs.ctrl.List(ctx, dirID[:])
+	if err != nil {
+		return nil, errors.Wrapf(err, "listing %q", dir)
 	}
-
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	seen := make(map[string]struct{})
-
-	// List objects.
-	for name := range fs.mu.objects {
-		if dir == "" || strings.HasPrefix(name, dir) {
-			// Get the relative name.
-			rel := strings.TrimPrefix(name, dir)
-			rel = strings.TrimPrefix(rel, "/")
-			// Get just the first component (file or directory name).
-			if idx := strings.Index(rel, "/"); idx != -1 {
-				rel = rel[:idx]
-			}
-			if rel != "" {
-				seen[rel] = struct{}{}
-			}
-		}
-	}
-
-	// List subdirectories.
-	for d := range fs.mu.dirs {
-		if dir == "" || strings.HasPrefix(d, dir) {
-			rel := strings.TrimPrefix(d, dir)
-			rel = strings.TrimPrefix(rel, "/")
-			if idx := strings.Index(rel, "/"); idx != -1 {
-				rel = rel[:idx]
-			}
-			if rel != "" {
-				seen[rel] = struct{}{}
-			}
-		}
-	}
-
-	result := make([]string, 0, len(seen))
-	for name := range seen {
-		result = append(result, name)
+	result := make([]string, len(entries))
+	for i, e := range entries {
+		result[i] = e.Name
 	}
 	sort.Strings(result)
-
 	return result, nil
 }
 
@@ -712,40 +523,43 @@ func (fs *FS) List(dir string) ([]string, error) {
 func (fs *FS) Stat(name string) (vfs.FileInfo, error) {
 	name = filepath.Clean(name)
 
+	// Root directory always exists.
+	if name == "." || name == "/" {
+		return &fileInfo{name: filepath.Base(name), size: 0, isDir: true}, nil
+	}
+
+	// Fast path: check local cache.
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	// Check if it's an object.
-	if meta, exists := fs.mu.objects[name]; exists {
+	meta, exists := fs.mu.objects[name]
+	fs.mu.Unlock()
+	if exists {
 		return &fileInfo{
-			name:  filepath.Base(name),
-			size:  meta.size,
-			isDir: false,
+			name: filepath.Base(name), size: meta.Size_, isDir: false,
 		}, nil
 	}
 
-	// Check if it's a directory.
-	if _, exists := fs.mu.dirs[name]; exists {
-		return &fileInfo{
-			name:  filepath.Base(name),
-			size:  0,
-			isDir: true,
-		}, nil
+	// Slow path: ask the controller.
+	ctx := context.Background()
+	dir, base := splitDirBase(name)
+	dirID, err := fs.resolveDir(ctx, dir)
+	if err != nil {
+		return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
 	}
-
-	// Check if any object has this as a prefix (implicit directory).
-	prefix := name + "/"
-	for n := range fs.mu.objects {
-		if strings.HasPrefix(n, prefix) {
-			return &fileInfo{
-				name:  filepath.Base(name),
-				size:  0,
-				isDir: true,
-			}, nil
+	resp, err := fs.ctrl.StatByPath(ctx, dirID[:], base)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
 		}
+		return nil, err
 	}
-
-	return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
+	isDir := resp.Type == basaltpb.EntryType_ENTRY_TYPE_DIRECTORY
+	size := int64(0)
+	if resp.Meta != nil && !isDir {
+		size = resp.Meta.Size_
+	}
+	return &fileInfo{
+		name: filepath.Base(name), size: size, isDir: isDir,
+	}, nil
 }
 
 // PathBase returns the last element of path.
@@ -774,7 +588,7 @@ func (fs *FS) GetDiskUsage(path string) (vfs.DiskUsage, error) {
 
 	var used uint64
 	for _, meta := range fs.mu.objects {
-		used += uint64(meta.size)
+		used += uint64(meta.Size_)
 	}
 
 	// Return a large available space since we're backed by distributed storage.
@@ -796,7 +610,7 @@ func (fs *FS) updateObjectSize(name string, size int64) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if meta, exists := fs.mu.objects[name]; exists {
-		meta.size = size
+		meta.Size_ = size
 	}
 }
 
@@ -805,11 +619,13 @@ func (fs *FS) sealObject(name string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if meta, exists := fs.mu.objects[name]; exists {
-		meta.sealed = true
+		if meta.SealedAtNanos == 0 {
+			meta.SealedAtNanos = 1 // Non-zero means sealed.
+		}
 	}
 }
 
-// backgroundContext returns a context for background operations.
-func (fs *FS) backgroundContext() context.Context {
-	return context.Background()
+// isNotFound returns true if the error is a gRPC NotFound status.
+func isNotFound(err error) bool {
+	return grpcstatus.Code(err) == codes.NotFound
 }

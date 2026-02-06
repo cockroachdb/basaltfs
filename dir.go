@@ -1,8 +1,8 @@
 // Directory operations for BasaltFS.
 //
-// BasaltFS uses a flat object namespace - directories are virtual constructs
-// implemented by path prefix matching. This mirrors how object storage systems
-// like S3 handle "directories".
+// Directories in BasaltFS are real entities managed by the controller.
+// Operations like MkdirAll create actual directory entries, and List/Stat
+// query the controller for directory contents and metadata.
 package basaltfs
 
 import (

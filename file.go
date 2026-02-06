@@ -2,11 +2,13 @@
 package basaltfs
 
 import (
+	"context"
 	"io"
 	"path/filepath"
 	"sync"
 
 	"github.com/cockroachdb/basaltclient"
+	"github.com/cockroachdb/basaltclient/basaltpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -17,7 +19,7 @@ type file struct {
 	fs        *FS
 	name      string
 	objectID  basaltclient.ObjectID
-	replicas  []string // data addresses of replicas
+	replicas  []*basaltpb.ReplicaInfo // data addresses + zones
 	readable  bool
 	writable  bool
 	walWriter *basaltclient.QuorumWriter // non-nil for WAL files
@@ -186,7 +188,7 @@ func (f *file) writeAtLocked(p []byte, off int64) (n int, err error) {
 	var wg sync.WaitGroup
 	errs := make([]error, len(f.replicas))
 
-	for i, replica := range f.replicas {
+	for i, r := range f.replicas {
 		wg.Add(1)
 		go func(idx int, addr string) {
 			defer wg.Done()
@@ -202,7 +204,7 @@ func (f *file) writeAtLocked(p []byte, off int64) (n int, err error) {
 				return
 			}
 			f.fs.dataPool.Release(client)
-		}(i, replica)
+		}(i, r.Addr)
 	}
 
 	wg.Wait()
@@ -239,7 +241,7 @@ func (f *file) Sync() error {
 	var wg sync.WaitGroup
 	errs := make([]error, len(f.replicas))
 
-	for i, replica := range f.replicas {
+	for i, r := range f.replicas {
 		wg.Add(1)
 		go func(idx int, addr string) {
 			defer wg.Done()
@@ -255,7 +257,7 @@ func (f *file) Sync() error {
 				return
 			}
 			f.fs.dataPool.Release(client)
-		}(i, replica)
+		}(i, r.Addr)
 	}
 
 	wg.Wait()
@@ -311,11 +313,10 @@ func (f *file) Close() error {
 		}
 	}
 
-	// For writable files, seal the object.
+	// For writable files, seal the object via the controller.
 	if f.writable {
-		replicas := f.fs.replicasForDataAddrs(f.replicas)
-		_, err := f.fs.sealOnAll(f.fs.backgroundContext(), f.objectID, replicas)
-		if err != nil && firstErr == nil {
+		ctx := context.Background()
+		if err := f.fs.ctrl.Seal(ctx, f.objectID[:], size); err != nil && firstErr == nil {
 			firstErr = err
 		}
 

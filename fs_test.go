@@ -1,99 +1,10 @@
 package basaltfs
 
-import "testing"
+import (
+	"testing"
 
-func TestParseServers(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   string
-		wantErr bool
-		count   int
-	}{
-		{
-			name:    "single server",
-			input:   "zone1@localhost:26258,localhost:26259",
-			wantErr: false,
-			count:   1,
-		},
-		{
-			name:    "multiple servers",
-			input:   "zone1@host1:26258,host1:26259;zone2@host2:26258,host2:26259;zone3@host3:26258,host3:26259",
-			wantErr: false,
-			count:   3,
-		},
-		{
-			name:    "with whitespace",
-			input:   " zone1@host1:26258,host1:26259 ; zone2@host2:26258,host2:26259 ",
-			wantErr: false,
-			count:   2,
-		},
-		{
-			name:    "empty string",
-			input:   "",
-			wantErr: true,
-			count:   0,
-		},
-		{
-			name:    "missing @",
-			input:   "zone1host1:26258,host1:26259",
-			wantErr: true,
-			count:   0,
-		},
-		{
-			name:    "missing comma",
-			input:   "zone1@host1:26258host1:26259",
-			wantErr: true,
-			count:   0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			servers, err := parseServers(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseServers() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if len(servers) != tt.count {
-				t.Errorf("parseServers() got %d servers, want %d", len(servers), tt.count)
-			}
-		})
-	}
-}
-
-func TestServerInfoParsing(t *testing.T) {
-	input := "zone1@ctrl1:26258,data1:26259;zone2@ctrl2:26258,data2:26259"
-	servers, err := parseServers(input)
-	if err != nil {
-		t.Fatalf("parseServers() error = %v", err)
-	}
-
-	if len(servers) != 2 {
-		t.Fatalf("expected 2 servers, got %d", len(servers))
-	}
-
-	// Check first server
-	if servers[0].zone != "zone1" {
-		t.Errorf("server[0].zone = %q, want %q", servers[0].zone, "zone1")
-	}
-	if servers[0].ctrlAddr != "ctrl1:26258" {
-		t.Errorf("server[0].ctrlAddr = %q, want %q", servers[0].ctrlAddr, "ctrl1:26258")
-	}
-	if servers[0].dataAddr != "data1:26259" {
-		t.Errorf("server[0].dataAddr = %q, want %q", servers[0].dataAddr, "data1:26259")
-	}
-
-	// Check second server
-	if servers[1].zone != "zone2" {
-		t.Errorf("server[1].zone = %q, want %q", servers[1].zone, "zone2")
-	}
-	if servers[1].ctrlAddr != "ctrl2:26258" {
-		t.Errorf("server[1].ctrlAddr = %q, want %q", servers[1].ctrlAddr, "ctrl2:26258")
-	}
-	if servers[1].dataAddr != "data2:26259" {
-		t.Errorf("server[1].dataAddr = %q, want %q", servers[1].dataAddr, "data2:26259")
-	}
-}
+	"github.com/cockroachdb/basaltclient/basaltpb"
+)
 
 func TestIsWALFile(t *testing.T) {
 	tests := []struct {
@@ -154,65 +65,91 @@ func TestFileInfo(t *testing.T) {
 	}
 }
 
-func TestSelectReplicas(t *testing.T) {
-	servers := []serverInfo{
-		{zone: "zone1", ctrlAddr: "ctrl1:26258", dataAddr: "data1:26259"},
-		{zone: "zone2", ctrlAddr: "ctrl2:26258", dataAddr: "data2:26259"},
-		{zone: "zone3", ctrlAddr: "ctrl3:26258", dataAddr: "data3:26259"},
-	}
-
-	fs := &FS{
-		opts: Options{
-			Replication: 2,
-			LocalZone:   "zone2",
-		},
-		servers: servers,
-	}
-
-	replicas := fs.selectReplicas()
-	if len(replicas) != 2 {
-		t.Fatalf("expected 2 replicas, got %d", len(replicas))
-	}
-
-	// Local zone should be first
-	if replicas[0].zone != "zone2" {
-		t.Errorf("first replica zone = %q, want %q (local zone should be preferred)", replicas[0].zone, "zone2")
-	}
-}
-
 func TestSelectReadReplica(t *testing.T) {
-	servers := []serverInfo{
-		{zone: "zone1", ctrlAddr: "ctrl1:26258", dataAddr: "data1:26259"},
-		{zone: "zone2", ctrlAddr: "ctrl2:26258", dataAddr: "data2:26259"},
-		{zone: "zone3", ctrlAddr: "ctrl3:26258", dataAddr: "data3:26259"},
-	}
-
 	fs := &FS{
 		opts: Options{
 			LocalZone: "zone2",
 		},
-		servers: servers,
 	}
 
-	replicas := []string{"data1:26259", "data2:26259", "data3:26259"}
+	replicas := []*basaltpb.ReplicaInfo{
+		{Addr: "data1:26259", Zone: "zone1"},
+		{Addr: "data2:26259", Zone: "zone2"},
+		{Addr: "data3:26259", Zone: "zone3"},
+	}
 	selected := fs.selectReadReplica(replicas)
 
-	// Should prefer local zone
+	// Should prefer local zone.
 	if selected != "data2:26259" {
 		t.Errorf("selectReadReplica() = %q, want %q (local zone replica)", selected, "data2:26259")
 	}
 
-	// Test with no local replica
+	// Test with no local replica.
 	fs.opts.LocalZone = "zone4"
 	selected = fs.selectReadReplica(replicas)
 	if selected != "data1:26259" {
 		t.Errorf("selectReadReplica() = %q, want %q (first replica when no local)", selected, "data1:26259")
 	}
 
-	// Test with empty replicas
+	// Test with empty replicas.
 	selected = fs.selectReadReplica(nil)
 	if selected != "" {
 		t.Errorf("selectReadReplica(nil) = %q, want empty string", selected)
+	}
+}
+
+func TestSplitPath(t *testing.T) {
+	tests := []struct {
+		path string
+		want []string
+	}{
+		{".", nil},
+		{"/", nil},
+		{"", nil},
+		{"foo", []string{"foo"}},
+		{"foo/bar", []string{"foo", "bar"}},
+		{"foo/bar/baz", []string{"foo", "bar", "baz"}},
+		{"/foo/bar", []string{"foo", "bar"}},
+		{"foo//bar", []string{"foo", "bar"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			got := splitPath(tt.path)
+			if len(got) != len(tt.want) {
+				t.Errorf("splitPath(%q) = %v, want %v", tt.path, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("splitPath(%q)[%d] = %q, want %q", tt.path, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestSplitDirBase(t *testing.T) {
+	tests := []struct {
+		name     string
+		wantDir  string
+		wantBase string
+	}{
+		{"foo.sst", ".", "foo.sst"},
+		{"wal/000001.log", "wal", "000001.log"},
+		{"a/b/c.txt", "a/b", "c.txt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir, base := splitDirBase(tt.name)
+			if dir != tt.wantDir {
+				t.Errorf("splitDirBase(%q) dir = %q, want %q", tt.name, dir, tt.wantDir)
+			}
+			if base != tt.wantBase {
+				t.Errorf("splitDirBase(%q) base = %q, want %q", tt.name, base, tt.wantBase)
+			}
+		})
 	}
 }
 
