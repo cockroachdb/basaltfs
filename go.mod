@@ -3,7 +3,7 @@ module github.com/cockroachdb/basaltfs
 go 1.25.3
 
 require (
-	github.com/cockroachdb/basaltclient v0.0.0-20260206033547-71709aa39edb
+	github.com/cockroachdb/basaltclient v0.0.0-20260206123142-3c7a47664958
 	github.com/cockroachdb/errors v1.12.0
 	github.com/cockroachdb/pebble v0.0.0-20260121183949-86f48627b1b4
 )
@@ -14,7 +14,6 @@ require (
 	github.com/cockroachdb/redact v1.1.5 // indirect
 	github.com/getsentry/sentry-go v0.27.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
-	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
