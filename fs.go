@@ -8,10 +8,13 @@
 //
 // Usage:
 //
+//	ctrl, _ := basaltclient.NewControllerClient("controller:26257")
+//	dataPool := basaltclient.NewBlobDataClientPool()
 //	fs, err := basaltfs.NewFS(basaltfs.Options{
-//	    Controller:  "controller:26257",
-//	    DirectoryID: directoryUUID,
-//	    LocalZone:   "zone1",
+//	    ControllerClient: ctrl,
+//	    DataPool:         dataPool,
+//	    DirectoryID:      directoryUUID,
+//	    LocalZone:        "zone1",
 //	})
 //	pebbleOpts := &pebble.Options{FS: fs}
 package basaltfs
@@ -21,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -35,8 +39,15 @@ import (
 
 // Options configures the FS behavior.
 type Options struct {
-	// Controller is the gRPC address of the Basalt controller.
-	Controller string
+	// ControllerClient is a shared controller client. The caller retains
+	// ownership and is responsible for closing it after all FS instances
+	// are done.
+	ControllerClient *basaltclient.ControllerClient
+
+	// DataPool is a shared blob data client pool. The caller retains
+	// ownership and is responsible for closing it after all FS instances
+	// are done.
+	DataPool *basaltclient.BlobDataClientPool
 
 	// DirectoryID is the resolved store directory ID. The caller (e.g. CRDB)
 	// resolves the namespace hierarchy (cluster/store) to a directory ID
@@ -56,74 +67,70 @@ type FS struct {
 
 	mu struct {
 		sync.Mutex
-		// Cache of metadata for known files. Populated from controller
-		// Create/List/Stat responses. Keyed by relative path.
+		// objects caches ObjectMeta for known files, keyed by relative path.
+		//
+		// Populated:
+		//   - List(): bulk-populated from DirectoryEntry data (includes replicas).
+		//     Pebble calls List during init/recovery, so this serves as the
+		//     primary cache warm-up path. Existing entries are unconditionally
+		//     overwritten since the controller has the freshest data and open
+		//     files hold their own copies of replicas and size.
+		//   - Open()/OpenReadWrite(): lazily populated via StatByPath on cache
+		//     miss, for files not yet seen via List.
+		//   - Create(): populated from the controller Create response.
+		//   - Link(): shallow-copied from the source entry.
+		//
+		// Updated:
+		//   - updateObjectSize(): updates Size_ after Sync.
+		//   - sealObject(): sets SealedAtNanos after Close of a writable file.
+		//
+		// Removed:
+		//   - Remove(): deletes the entry.
+		//   - RemoveAll(): deletes entries matching a path prefix.
+		//   - Rename(): deletes old key, inserts new key.
+		//   - Create(): if file already exists, Remove is called first.
 		objects map[string]*basaltpb.ObjectMeta
 	}
 }
 
 var _ vfs.FS = (*FS)(nil)
 
-// NewFS creates a new FS using the given options. It connects to the controller
-// and populates the local file cache from the store directory.
+// NewFS creates a new FS using the given options. The caller retains ownership
+// of ControllerClient and DataPool and must close them after all FS instances
+// are done. The cache is populated lazily: List() bulk-populates from
+// DirectoryEntry data (Pebble calls List during init), and Open() falls back
+// to StatByPath on cache miss.
 func NewFS(opts Options) (*FS, error) {
-	if opts.Controller == "" {
-		return nil, errors.New("controller address is required")
+	if opts.ControllerClient == nil {
+		return nil, errors.New("controller client is required")
+	}
+	if opts.DataPool == nil {
+		return nil, errors.New("data pool is required")
 	}
 	var nilUUID basaltpb.UUID
 	if opts.DirectoryID == nilUUID {
 		return nil, errors.New("directory ID is required")
 	}
 
-	ctrl, err := basaltclient.NewControllerClient(opts.Controller)
-	if err != nil {
-		return nil, errors.Wrap(err, "connecting to controller")
-	}
-
-	ctx := context.Background()
-
 	fs := &FS{
 		opts:        opts,
-		ctrl:        ctrl,
-		dataPool:    basaltclient.NewBlobDataClientPool(),
+		ctrl:        opts.ControllerClient,
+		dataPool:    opts.DataPool,
 		directoryID: opts.DirectoryID,
 	}
 	fs.mu.objects = make(map[string]*basaltpb.ObjectMeta)
 
-	// Populate cache from controller.
-	entries, err := ctrl.List(ctx, fs.directoryID[:])
-	if err != nil {
-		ctrl.Close()
-		return nil, errors.Wrap(err, "listing store directory")
-	}
-
-	for _, entry := range entries {
-		if entry.Type == basaltpb.EntryType_ENTRY_TYPE_DIRECTORY {
-			continue
-		}
-		// Get full metadata including replica addresses.
-		statResp, err := ctrl.StatByID(ctx, entry.Id[:], false, false)
-		if err != nil {
-			ctrl.Close()
-			return nil, errors.Wrapf(err, "stat object %s (%s)", entry.Name, entry.Id)
-		}
-		fs.mu.objects[entry.Name] = statResp.Meta
-	}
-
 	return fs, nil
 }
 
-// Close releases resources associated with the filesystem.
+// Close releases resources associated with the filesystem. The caller-owned
+// ControllerClient and DataPool are not closed here.
 func (fs *FS) Close() error {
 	// TODO: Call ctrl.Unmount(mountID) once Mount/Unmount is implemented.
-	var firstErr error
-	if err := fs.ctrl.Close(); err != nil {
-		firstErr = err
-	}
-	if err := fs.dataPool.Close(); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	return firstErr
+	fs.mu.Lock()
+	fs.mu.objects = nil
+	fs.mu.Unlock()
+	return nil
 }
 
 // isWALFile returns true if the file path indicates a WAL file.
@@ -250,7 +257,24 @@ func (fs *FS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	fs.mu.Unlock()
 
 	if !exists {
-		return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrNotExist}
+		// Lazy cache population: fetch metadata from the controller for
+		// files not yet seen via List (e.g. files in subdirectories).
+		ctx := context.Background()
+		dirID, base, err := fs.resolveDirForPath(ctx, name)
+		if err != nil {
+			return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrNotExist}
+		}
+		resp, err := fs.ctrl.StatByPath(ctx, dirID[:], base, false)
+		if err != nil {
+			if isNotFound(err) {
+				return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrNotExist}
+			}
+			return nil, err
+		}
+		meta = resp.Meta
+		fs.mu.Lock()
+		fs.mu.objects[name] = meta
+		fs.mu.Unlock()
 	}
 
 	f := &file{
@@ -280,6 +304,22 @@ func (fs *FS) OpenReadWrite(
 	fs.mu.Lock()
 	meta, exists := fs.mu.objects[name]
 	fs.mu.Unlock()
+
+	if !exists {
+		// Lazy cache population: try to fetch before falling through to Create.
+		ctx := context.Background()
+		dirID, base, err := fs.resolveDirForPath(ctx, name)
+		if err == nil {
+			resp, err := fs.ctrl.StatByPath(ctx, dirID[:], base, false)
+			if err == nil {
+				meta = resp.Meta
+				exists = true
+				fs.mu.Lock()
+				fs.mu.objects[name] = meta
+				fs.mu.Unlock()
+			}
+		}
+	}
 
 	if !exists {
 		return fs.Create(name, category)
@@ -501,6 +541,7 @@ func (fs *FS) Lock(name string) (io.Closer, error) {
 // List returns the names of files in a directory.
 // Implements vfs.FS.List.
 func (fs *FS) List(dir string) ([]string, error) {
+	dir = filepath.Clean(dir)
 	ctx := context.Background()
 	dirID, err := fs.resolveDir(ctx, dir)
 	if err != nil {
@@ -510,6 +551,31 @@ func (fs *FS) List(dir string) ([]string, error) {
 	if err != nil {
 		return nil, errors.Wrapf(err, "listing %q", dir)
 	}
+
+	// Populate cache from DirectoryEntry data. The List response now
+	// includes replica addresses, so we can build ObjectMeta without
+	// per-file StatByID calls. Existing entries are unconditionally
+	// overwritten since the controller has the freshest data. Open
+	// files hold their own copies of replicas and size.
+	fs.mu.Lock()
+	for _, e := range entries {
+		if e.Type != basaltpb.EntryType_ENTRY_TYPE_FILE {
+			continue
+		}
+		entryPath := e.Name
+		if dir != "." {
+			entryPath = dir + "/" + e.Name
+		}
+		fs.mu.objects[entryPath] = &basaltpb.ObjectMeta{
+			Id:             e.Id,
+			Size_:          e.Size_,
+			Replicas:       slices.Clone(e.Replicas),
+			CreatedAtNanos: e.CreatedAtNanos,
+			SealedAtNanos:  e.SealedAtNanos,
+		}
+	}
+	fs.mu.Unlock()
+
 	result := make([]string, len(entries))
 	for i, e := range entries {
 		result[i] = e.Name
