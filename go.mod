@@ -27,5 +27,7 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
+replace github.com/gogo/protobuf => github.com/cockroachdb/gogoproto v1.3.3-0.20241216150617-2358cdb156a1
+
 // Exclude old genproto that conflicts with the new split modules
 exclude google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1
