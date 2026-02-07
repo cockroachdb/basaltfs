@@ -1,5 +1,5 @@
-github.com/cockroachdb/basaltclient v0.0.0-20260207164642-c3d315f89667 h1:uMQrm2vE5ettZNanycE9yWiGxP/sngKfQYEepp+sx1I=
-github.com/cockroachdb/basaltclient v0.0.0-20260207164642-c3d315f89667/go.mod h1:DLJdKLGlXRIzRQMBUDBneS5B0eMJHevC48fs8WxHYJQ=
+github.com/cockroachdb/basaltclient v0.0.0-20260207215058-e14238434045 h1:0r0o09qB4vO6meNDM5MwAP+B4wCPIQJ2N2CgqWcr9TU=
+github.com/cockroachdb/basaltclient v0.0.0-20260207215058-e14238434045/go.mod h1:8BkShgCiG8wsilIyn++DY+cI1lSvNW6ofhd5xUY/t2s=
 github.com/cockroachdb/crlib v0.0.0-20251122031428-fe658a2dbda1 h1:iX0YCYC5Jbt2/g7zNTP/QxhrV8Syp5kkzNiERKeN1uE=
 github.com/cockroachdb/crlib v0.0.0-20251122031428-fe658a2dbda1/go.mod h1:NjNuToN/FbhwH1cCyM9G4Rhtxx+ZaOgtoqFR+thng7w=
 github.com/cockroachdb/datadriven v1.0.3-0.20251123150250-ddff6747b112 h1:T1++5Vt0/4/IWZ1mHmUYl7fhQnz50QhNWIY+ITvLLIM=
