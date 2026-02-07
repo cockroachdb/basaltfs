@@ -1,6 +1,7 @@
 package basaltfs
 
 import (
+	"io"
 	"testing"
 
 	"github.com/cockroachdb/basaltclient/basaltpb"
@@ -169,21 +170,33 @@ func TestDirHandleMethods(t *testing.T) {
 	if n != 0 {
 		t.Errorf("Read() n = %d, want 0", n)
 	}
+	if err != io.EOF {
+		t.Errorf("Read() err = %v, want io.EOF", err)
+	}
 
 	// ReadAt should return EOF
 	n, err = dh.ReadAt(buf, 0)
 	if n != 0 {
 		t.Errorf("ReadAt() n = %d, want 0", n)
 	}
+	if err != io.EOF {
+		t.Errorf("ReadAt() err = %v, want io.EOF", err)
+	}
 
 	// Write should return error
 	n, err = dh.Write(buf)
+	if n != 0 {
+		t.Errorf("Write() n = %d, want 0", n)
+	}
 	if err == nil {
 		t.Error("Write() should return error")
 	}
 
 	// WriteAt should return error
 	n, err = dh.WriteAt(buf, 0)
+	if n != 0 {
+		t.Errorf("WriteAt() n = %d, want 0", n)
+	}
 	if err == nil {
 		t.Error("WriteAt() should return error")
 	}
