@@ -126,7 +126,7 @@ func NewFS(opts Options) (*FS, error) {
 // Close releases resources associated with the filesystem. The caller-owned
 // ControllerClient and DataPool are not closed here.
 func (fs *FS) Close() error {
-	// TODO: Call ctrl.Unmount(mountID) once Mount/Unmount is implemented.
+	// TODO(cockroachlabs/basalt#1): Call ctrl.Unmount(mountID) once Mount/Unmount is implemented.
 	fs.mu.Lock()
 	fs.mu.objects = nil
 	fs.mu.Unlock()
