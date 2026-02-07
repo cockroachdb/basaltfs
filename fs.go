@@ -102,7 +102,7 @@ func NewFS(opts Options) (*FS, error) {
 			continue
 		}
 		// Get full metadata including replica addresses.
-		statResp, err := ctrl.StatByID(ctx, entry.Id[:], false)
+		statResp, err := ctrl.StatByID(ctx, entry.Id[:], false, false)
 		if err != nil {
 			ctrl.Close()
 			return nil, errors.Wrapf(err, "stat object %s (%s)", entry.Name, entry.Id)
@@ -170,7 +170,7 @@ func splitDirBase(name string) (dir, base string) {
 func (fs *FS) resolveDir(ctx context.Context, dir string) (basaltpb.UUID, error) {
 	currentID := fs.directoryID
 	for _, comp := range splitPath(dir) {
-		resp, err := fs.ctrl.StatByPath(ctx, currentID[:], comp)
+		resp, err := fs.ctrl.StatByPath(ctx, currentID[:], comp, false)
 		if err != nil {
 			return basaltpb.UUID{}, errors.Wrapf(err, "resolving %q", comp)
 		}
@@ -477,7 +477,7 @@ func (fs *FS) MkdirAll(dir string, perm os.FileMode) error {
 		newID, err := fs.ctrl.Mkdir(ctx, currentID[:], comp)
 		if err != nil {
 			// May already exist — look it up.
-			resp, lookupErr := fs.ctrl.StatByPath(ctx, currentID[:], comp)
+			resp, lookupErr := fs.ctrl.StatByPath(ctx, currentID[:], comp, false)
 			if lookupErr != nil {
 				return errors.Wrapf(err, "creating directory %q", comp)
 			}
@@ -545,7 +545,7 @@ func (fs *FS) Stat(name string) (vfs.FileInfo, error) {
 	if err != nil {
 		return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
 	}
-	resp, err := fs.ctrl.StatByPath(ctx, dirID[:], base)
+	resp, err := fs.ctrl.StatByPath(ctx, dirID[:], base, false)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
