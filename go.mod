@@ -3,10 +3,10 @@ module github.com/cockroachdb/basaltfs
 go 1.25.3
 
 require (
-	github.com/cockroachdb/basaltclient v0.0.0-20260207222539-1a89a01baab7
+	github.com/cockroachdb/basaltclient v0.0.0-20260211220238-810f233478af
 	github.com/cockroachdb/errors v1.12.0
 	github.com/cockroachdb/pebble v0.0.0-20260121183949-86f48627b1b4
-	google.golang.org/grpc v1.57.2
+	google.golang.org/grpc v1.78.0
 )
 
 require (
