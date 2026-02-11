@@ -6,7 +6,7 @@ require (
 	github.com/cockroachdb/basaltclient v0.0.0-20260211220238-810f233478af
 	github.com/cockroachdb/errors v1.12.0
 	github.com/cockroachdb/pebble v0.0.0-20260121183949-86f48627b1b4
-	google.golang.org/grpc v1.78.0
+	google.golang.org/grpc v1.57.2
 )
 
 require (
@@ -15,6 +15,7 @@ require (
 	github.com/cockroachdb/redact v1.1.5 // indirect
 	github.com/getsentry/sentry-go v0.27.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
